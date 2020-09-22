@@ -1,0 +1,120 @@
+#!/usr/bin/perl
+#
+use utf8;
+use strict;
+use warnings;
+use Encode qw/encode_utf8 decode/;
+use MIME::Base64;
+use HTML::FormatText::Html2text;
+# SMTP server
+use Net::SMTP::Server;
+use Net::SMTP::Server::Client;
+# Slack
+use LWP::UserAgent;
+use JSON;
+
+# settings
+my $SMTP_LISTEN_IP = (exists $ENV{'SMTP_LISTEN_IP'}) ? $ENV{'SMTP_LISTEN_IP'} : '0.0.0.0';
+my $SMTP_LISTEN_PORT = (exists $ENV{'SMTP_LISTEN_PORT'}) ? $ENV{'SMTP_LISTEN_PORT'} : 25;
+my $SLACK_WEBHOOK = $ENV{'SLACK_WEBHOOK'};
+
+# subroutine
+sub decode_mime_to_utf8
+{
+    my ($src) = @_;
+    $src =~ s/=\?([^?]+)\?([bq])\?([^?=]+)\?=\s+=\?\g1\?\g2\?(.+)/=?$1?$2?$3$4/ig;
+    return decode('MIME-Header', $src);
+}
+
+sub slack_send
+{
+    my ($channel, $name, $text) = @_;
+
+    my %json_content = (
+        channel => $channel,
+        username => $name,
+        text => $text,
+    );
+    my $content = "payload=".encode_json(\%json_content);
+
+    my $ua = LWP::UserAgent->new;
+    $ua->env_proxy;
+
+    my $response = $ua->post($SLACK_WEBHOOK, 'Content' => $content);
+
+    if (! $response->is_success) {
+        print "send content: $content\n";
+        print "Error: ".$response->status_line."(".$response->content.")";
+    }
+}
+
+sub html2text
+{
+    my ($html) = @_;
+
+    $html =~ s/[\r\n\t]//g;
+    $html =~ s|</div>|\n|ig;
+    $html =~ s|</?br>|\n|ig;
+    $html =~ s|<.*?>||g;
+    $html =~ s/&nbsp;/ /ig;
+    $html =~ s/&[^;]*;//ig;
+
+    return $html;
+}
+
+# main
+my $server = new Net::SMTP::Server($SMTP_LISTEN_IP, $SMTP_LISTEN_PORT)
+    || die("failed to open server. check another program listen on port $SMTP_LISTEN_PORT");
+
+while(my $conn = $server->accept()) {
+    my $client = new Net::SMTP::Server::Client($conn)
+        || die('failed to open client connection');
+
+    $client->process || next;
+
+    # separate
+    my $message = $client->{MSG};
+    my ($header, $body) = split(/(?:\r\n){2}/, $message, 2);
+
+    # parse header
+    my %header = ();
+    while($header =~ m/^([^:]*): ?(.*?)$/gm) {
+        my ($key, $value) = ($1, $2);
+        $value =~ s/[\r\n]//g;
+        $header{$key} = $value;
+    }
+
+    # get target channel
+    my $mail_to = "";
+    if ($header{'To'} =~ m/<(.*)>/) {
+        $mail_to = $1;
+    } else {
+        $mail_to = $header{'To'};
+    }
+    my ($target_channel, undef) = split(/\@/, $mail_to);
+    $target_channel = "#".$target_channel;
+
+    # get subject
+    my $subject = &decode_mime_to_utf8($header{'Subject'});
+
+    # decode body
+    if ($header{'Content-Transfer-Encoding'} eq "base64") {
+        $body = MIME::Base64::decode($body);
+    }
+    if (exists $header{'Content-type'}) {
+        $header{'Content-Type'} = $header{'Content-type'};
+    }
+    if ($header{'Content-Type'} =~ m/charset="?([^;"]+)"?/) {
+        my $code = $1;
+        $body = decode($code, $body);
+    }
+    if ($header{'Content-Type'} =~ m/^text\/html/) {
+        $body = &html2text($body);
+    }
+
+    my $text = "Subject: $subject\n$body";
+
+    &slack_send($target_channel, "SMTP", $text);
+}
+
+exit;
